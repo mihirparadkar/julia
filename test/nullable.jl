@@ -1,6 +1,5 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
 
-@testset "nullable" begin
 types = [
     Bool,
     Float16,
@@ -353,4 +352,3 @@ end
 # issue #11675
 @test repr(Nullable()) == "Nullable{Union{}}()"
 
-end
