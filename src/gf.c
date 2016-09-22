@@ -134,8 +134,10 @@ JL_DLLEXPORT jl_method_instance_t *jl_specializations_get_linfo(jl_method_t *m, 
     jl_typemap_entry_t *sf = jl_typemap_assoc_by_type(
             m->specializations, type, NULL, 2, /*subtype*/0, /*offs*/0, world);
     if (sf && jl_is_method_instance(sf->func.value)) {
+        jl_method_instance_t *linfo = (jl_method_instance_t*)sf->func.value;
+        assert(linfo->min_world == sf->min_world && linfo->max_world == sf->max_world);
         JL_UNLOCK(&m->writelock);
-        return (jl_method_instance_t*)sf->func.value;
+        return linfo;
     }
     jl_method_instance_t *li = jl_get_specialized(m, type, sparams);
     JL_GC_PUSH1(&li);
@@ -322,11 +324,11 @@ JL_DLLEXPORT jl_method_instance_t* jl_set_lambda_inferred(
                 // expand the current (uninferred) entry to cover the full inferred range
                 if (li->min_world != min_world) {
                     li->min_world = min_world;
-                    jl_typemap_visitor(li->def->specializations, set_min_world, (void*)li);
+                    update_caches(li, set_min_world);
                 }
                 if (li->max_world != max_world) {
                     li->max_world = max_world;
-                    jl_typemap_visitor(li->def->specializations, set_max_world, (void*)li);
+                    update_caches(li, set_max_world);
                 }
             }
             else {
@@ -513,7 +515,7 @@ static jl_tupletype_t *join_tsig(jl_tupletype_t *tt, jl_tupletype_t *sig)
 
 static jl_value_t *ml_matches(union jl_typemap_t ml, int offs,
                               jl_tupletype_t *type, int lim, int include_ambiguous,
-                              size_t world);
+                              size_t world, size_t *min_valid, size_t *max_valid);
 
 static void jl_cacheable_sig(
     jl_tupletype_t *const type, // the specialized type signature for type lambda
@@ -841,6 +843,8 @@ static jl_method_instance_t *cache_method(jl_methtable_t *mt, union jl_typemap_t
         need_guard_entries = 1;
     }
 
+    size_t min_valid = definition->min_world;
+    size_t max_valid = definition->max_world;
     int cache_with_orig = 0;
     jl_svec_t* guardsigs = jl_emptysvec;
     jl_tupletype_t *origtype = type; // backup the prior value of `type`
@@ -849,7 +853,7 @@ static jl_method_instance_t *cache_method(jl_methtable_t *mt, union jl_typemap_t
         temp2 = (jl_value_t*)type;
     }
     if (need_guard_entries) {
-        temp = ml_matches(mt->defs, 0, type, -1, 0, 0); // TODO: use MAX_UNSPECIALIZED_CONFLICTS?
+        temp = ml_matches(mt->defs, 0, type, -1, 0, world, &min_valid, &max_valid); // TODO: use MAX_UNSPECIALIZED_CONFLICTS?
         int guards = 0;
         if (temp == jl_false) {
             cache_with_orig = 1;
@@ -890,11 +894,12 @@ static jl_method_instance_t *cache_method(jl_methtable_t *mt, union jl_typemap_t
             guards = 0;
             for(i = 0, l = jl_array_len(temp); i < l; i++) {
                 jl_value_t *m = jl_array_ptr_ref(temp, i);
-                if (((jl_method_t*)jl_svecref(m,2)) != definition) {
+                jl_method_t *other = (jl_method_t*)jl_svecref(m, 2);
+                if (other != definition) {
                     jl_svecset(guardsigs, guards, (jl_tupletype_t*)jl_svecref(m, 0));
                     guards++;
                     //jl_typemap_insert(cache, parent, (jl_tupletype_t*)jl_svecref(m, 0),
-                    //        jl_emptysvec, NULL, jl_emptysvec, /*guard*/NULL, jl_cachearg_offset(mt), &lambda_cache, 1, ~(size_t)0, NULL);
+                    //        jl_emptysvec, NULL, jl_emptysvec, /*guard*/NULL, jl_cachearg_offset(mt), &lambda_cache, other->min_world, other->max_world, NULL);
                 }
             }
         }
@@ -902,6 +907,10 @@ static jl_method_instance_t *cache_method(jl_methtable_t *mt, union jl_typemap_t
 
     // here we infer types and specialize the method
     newmeth = jl_specializations_get_linfo(definition, type, sparams, world);
+    if (newmeth->min_world > min_valid)
+        min_valid = newmeth->min_world;
+    if (newmeth->max_world < max_valid)
+        max_valid = newmeth->max_world;
 
     if (cache_with_orig) {
         // if there is a need to cache with one of the original signatures,
@@ -940,7 +949,7 @@ static jl_method_instance_t *cache_method(jl_methtable_t *mt, union jl_typemap_t
     }
 
     jl_typemap_insert(cache, parent, origtype, jl_emptysvec, type, guardsigs, (jl_value_t*)newmeth, jl_cachearg_offset(mt), &lambda_cache,
-            newmeth->min_world, newmeth->max_world, NULL);
+            min_valid, max_valid, NULL);
 
     if (definition->traced && jl_method_tracer && allow_exec)
         jl_call_tracer(jl_method_tracer, (jl_value_t*)newmeth);
@@ -1378,13 +1387,24 @@ jl_method_instance_t *jl_method_lookup_by_type(jl_methtable_t *mt, jl_tupletype_
                                            int cache, int inexact, int allow_exec, size_t world)
 {
     jl_typemap_entry_t *entry = jl_typemap_assoc_by_type(mt->cache, types, NULL, 0, 1, jl_cachearg_offset(mt), world);
-    if (entry)
-        return entry->func.linfo;
+    if (entry) {
+        jl_method_instance_t *linfo = (jl_method_instance_t*)entry->func.value;
+#ifndef JULIA_THREADING
+        // with threading, this condition is only eventually-consistent
+        assert(linfo->min_world == entry->min_world && linfo->max_world == entry->max_world);
+#endif
+        return linfo;
+    }
     JL_LOCK(&mt->writelock);
     entry = jl_typemap_assoc_by_type(mt->cache, types, NULL, 0, 1, jl_cachearg_offset(mt), world);
     if (entry) {
+        jl_method_instance_t *linfo = (jl_method_instance_t*)entry->func.value;
+#ifndef JULIA_THREADING
+        // with threading, this condition is only eventually-consistent
+        assert(linfo->min_world == entry->min_world && linfo->max_world == entry->max_world);
+#endif
         JL_UNLOCK(&mt->writelock);
-        return entry->func.linfo;
+        return linfo;
     }
     if (jl_is_leaf_type((jl_value_t*)types))
         cache = 1;
@@ -1439,18 +1459,24 @@ jl_method_instance_t *jl_method_lookup(jl_methtable_t *mt, jl_value_t **args, si
 //
 // lim is the max # of methods to return. if there are more, returns jl_false.
 // -1 for no limit.
-JL_DLLEXPORT jl_value_t *jl_matching_methods(jl_tupletype_t *types, int lim, int include_ambiguous, size_t world)
+JL_DLLEXPORT jl_value_t *jl_matching_methods(jl_tupletype_t *types, int lim, int include_ambiguous, size_t world, size_t *min_valid, size_t *max_valid)
 {
     assert(jl_nparams(types) > 0);
-    if (jl_tparam0(types) == jl_bottom_type)
-        return (jl_value_t*)jl_alloc_vec_any(0);
-    if (!jl_is_datatype(jl_tparam0(types))) {
+    jl_value_t *matches = NULL;
+    if (jl_tparam0(types) == jl_bottom_type) {
+        matches = (jl_value_t*)jl_alloc_vec_any(0);
+    }
+    else if (!jl_is_datatype(jl_tparam0(types))) {
         return jl_false; // indeterminate - ml_matches can't deal with this case
     }
-    jl_methtable_t *mt = ((jl_datatype_t*)jl_tparam0(types))->name->mt;
-    if (mt == NULL)
-        return (jl_value_t*)jl_alloc_vec_any(0);
-    return ml_matches(mt->defs, 0, types, lim, include_ambiguous, world);
+    else {
+        jl_methtable_t *mt = ((jl_datatype_t*)jl_tparam0(types))->name->mt;
+        if (mt == NULL)
+            matches = (jl_value_t*)jl_alloc_vec_any(0);
+        else
+            matches = ml_matches(mt->defs, 0, types, lim, include_ambiguous, world, min_valid, max_valid);
+    }
+    return matches;
 }
 
 jl_llvm_functions_t jl_compile_for_dispatch(jl_method_instance_t **pli, size_t world)
@@ -1520,8 +1546,10 @@ jl_method_instance_t *jl_get_specialization1(jl_tupletype_t *types, size_t world
         // if one argument type is DataType, multiple Type{} definitions
         // might match. also be conservative with tuples rather than trying
         // to analyze them in detail.
+        size_t min_valid = 0;
+        size_t max_valid = ~(size_t)0;
         if (ti == (jl_value_t*)jl_datatype_type || jl_is_tuple_type(ti)) {
-            jl_value_t *matches = jl_matching_methods(types, 1, 0, world);
+            jl_value_t *matches = jl_matching_methods(types, 1, 0, world, &min_valid, &max_valid);
             if (matches == jl_false)
                 return NULL;
             break;
@@ -2259,19 +2287,30 @@ static int tvar_exists_at_top_level(jl_value_t *tv, jl_tupletype_t *sig, int att
 
 struct ml_matches_env {
     struct typemap_intersection_env match;
-    jl_value_t *t;     // results: array of svec(argtypes, params, Method)
+    // results:
+    jl_value_t *t; // array of svec(argtypes, params, Method)
+    size_t min_valid;
+    size_t max_valid;
+    // temporary:
     jl_svec_t *matc;   // current working svec
+    // inputs:
+    size_t world;
     int lim;
     int include_ambiguous;  // whether ambiguous matches should be included
-    size_t world;
 };
 static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersection_env *closure0)
 {
     struct ml_matches_env *closure = container_of(closure0, struct ml_matches_env, match);
     int i;
-    if (closure->world != 0) // use zero as a flag value for returning all matches
-        if (closure->world < ml->min_world || closure->world > ml->max_world)
+    if (closure->world != 0) { // use zero as a flag value for returning all matches
+        if (ml->min_world < closure->min_valid)
+            closure->min_valid = ml->min_world;
+        if (ml->max_world > closure->max_valid)
+            closure->max_valid = ml->max_world;
+        if (closure->world < ml->min_world || closure->world > ml->max_world) {
             return 1; // ignore method table entries that are not part of this world
+        }
+    }
     // a method is shadowed if type <: S <: m->sig where S is the
     // signature of another applicable method
     /*
@@ -2412,7 +2451,7 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
 // See below for the meaning of lim.
 static jl_value_t *ml_matches(union jl_typemap_t defs, int offs,
                               jl_tupletype_t *type, int lim, int include_ambiguous,
-                              size_t world)
+                              size_t world, size_t *min_valid, size_t *max_valid)
 {
     size_t l = jl_svec_len(type->parameters);
     jl_value_t *va = NULL;
@@ -2434,9 +2473,13 @@ static jl_value_t *ml_matches(union jl_typemap_t defs, int offs,
     env.lim = lim;
     env.include_ambiguous = include_ambiguous;
     env.world = world;
+    env.min_valid = *min_valid;
+    env.max_valid = *max_valid;
     JL_GC_PUSH4(&env.t, &env.matc, &env.match.env, &env.match.ti);
     jl_typemap_intersection_visitor(defs, offs, &env.match);
     JL_GC_POP();
+    *min_valid = env.min_valid;
+    *max_valid = env.max_valid;
     return env.t;
 }
 
