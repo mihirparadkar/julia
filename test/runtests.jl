@@ -76,6 +76,22 @@ cd(dirname(@__FILE__)) do
         end
         push!(results, (t, resp))
     end
+    #=
+`   Construct a testset on the master node which will hold results from all the
+    test files run on workers and on node1. The loop goes through the results,
+    inserting them as children of the overall testset if they are testsets,
+    handling errors otherwise.
+
+    Since the workers don't return information about passing/broken tests, only
+    errors or failures, those Result types get passed `nothing` for their test
+    expressions (and expected/received result in the case of Broken).
+
+    If a test failed, returning a `RemoteException`, the error is displayed and
+    the overall testset has a child testset inserted, with the (empty) Passes
+    and Brokens from the worker and the full information about all errors and
+    failures encountered running the tests. This information will be displayed
+    as a summary at the end of the test run.
+    =#
     o_ts = Base.Test.DefaultTestSet("Overall")
     Base.Test.push_testset(o_ts)
     for res in results
