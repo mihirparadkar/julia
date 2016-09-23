@@ -66,7 +66,7 @@ end
 @test contains(sprint(show, fails[4]), "Unexpected Pass")
 
 # Test printing of a TestSetException
-tse_str = sprint(show, Test.TestSetException(1,2,3,4,nothing))
+tse_str = sprint(show, Test.TestSetException(1,2,3,4,Vector{Union{Base.Test.Error, Base.Test.Fail}}()))
 @test contains(tse_str, "1 passed")
 @test contains(tse_str, "2 failed")
 @test contains(tse_str, "3 errored")
