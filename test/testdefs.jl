@@ -12,7 +12,12 @@ function runtests(name)
     #res_and_time_data[1] is the testset
     passes,fails,error,broken,c_passes,c_fails,c_errors,c_broken = Base.Test.get_test_counts(res_and_time_data[1])
     if res_and_time_data[1].anynonpass == false
-        res_and_time_data = ((passes+c_passes,broken+c_broken), res_and_time_data[2], res_and_time_data[3], res_and_time_data[4], res_and_time_data[5])
+        res_and_time_data = (
+                             (passes+c_passes,broken+c_broken),
+                             res_and_time_data[2],
+                             res_and_time_data[3],
+                             res_and_time_data[4],
+                             res_and_time_data[5])
     end
     vcat(collect(res_and_time_data), rss)
 end
